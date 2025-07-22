@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/errors"
@@ -99,6 +100,10 @@ func (prov *Provisioning) ValidateBaremetalProvisioningConfig(enabledFeatures En
 		if prov.Spec.ProvisioningDHCPRange == "" {
 			errs = append(errs, fmt.Errorf("provisioningDHCPRange is required in Managed mode but is not set"))
 		}
+	}
+
+	if err := validateProviderNetworks(prov.Spec.SwitchManagement); err != nil {
+		errs = append(errs, err...)
 	}
 
 	return errors.NewAggregate(errs)
@@ -283,5 +288,84 @@ func validateProvisioningNetworkSettings(ip string, cidr string, dhcpRange strin
 		}
 	}
 
+	return errs
+}
+
+const (
+	minVLAN = 1
+	maxVLAN = 4094
+)
+
+func validateVLANID(s string) (int, error) {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a valid VLAN ID", s)
+	}
+	if v < minVLAN || v > maxVLAN {
+		return 0, fmt.Errorf("VLAN ID %d is out of range (%d-%d)", v, minVLAN, maxVLAN)
+	}
+	return v, nil
+}
+
+func validateAllowedVLANEntry(entry string) error {
+	parts := strings.SplitN(entry, "-", 2)
+	if len(parts) == 1 {
+		_, err := validateVLANID(strings.TrimSpace(parts[0]))
+		return err
+	}
+	start, err := validateVLANID(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return fmt.Errorf("invalid range %q: %w", entry, err)
+	}
+	end, err := validateVLANID(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return fmt.Errorf("invalid range %q: %w", entry, err)
+	}
+	if start >= end {
+		return fmt.Errorf("invalid range %q: start (%d) must be less than end (%d)", entry, start, end)
+	}
+	return nil
+}
+
+func validateProviderNetworks(sm *SwitchManagement) []error {
+	if sm == nil || len(sm.ProviderNetworks) == 0 {
+		return nil
+	}
+
+	var errs []error
+
+	if !sm.Enabled {
+		errs = append(errs, fmt.Errorf("providerNetworks cannot be set when switchManagement is not enabled"))
+		return errs
+	}
+
+	seen := make(map[ProviderNetworkType]bool)
+	for i, pn := range sm.ProviderNetworks {
+		if seen[pn.Type] {
+			errs = append(errs, fmt.Errorf("providerNetworks[%d]: duplicate type %q", i, pn.Type))
+		}
+		seen[pn.Type] = true
+
+		if pn.NativeVLAN < minVLAN || pn.NativeVLAN > maxVLAN {
+			errs = append(errs, fmt.Errorf("providerNetworks[%d].nativeVLAN: value %d is out of range (%d-%d)", i, pn.NativeVLAN, minVLAN, maxVLAN))
+		}
+
+		switch pn.Mode {
+		case SwitchportModeAccess:
+			if len(pn.AllowedVLANs) > 0 {
+				errs = append(errs, fmt.Errorf("providerNetworks[%d]: allowedVLANs cannot be set in access mode", i))
+			}
+		case SwitchportModeTrunk, SwitchportModeHybrid:
+			if len(pn.AllowedVLANs) == 0 {
+				errs = append(errs, fmt.Errorf("providerNetworks[%d]: allowedVLANs required for %s mode", i, pn.Mode))
+			}
+		}
+
+		for j, entry := range pn.AllowedVLANs {
+			if err := validateAllowedVLANEntry(entry); err != nil {
+				errs = append(errs, fmt.Errorf("providerNetworks[%d].allowedVLANs[%d]: %w", i, j, err))
+			}
+		}
+	}
 	return errs
 }

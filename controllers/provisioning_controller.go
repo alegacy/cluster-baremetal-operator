@@ -331,6 +331,8 @@ func (r *ProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	for _, ensureResource := range []ensureFunc{
 		provisioning.EnsureAllSecrets,
+		provisioning.EnsureIronicNetworkingDeployment,
+		provisioning.EnsureIronicNetworkingService,
 		provisioning.EnsureMetal3Deployment,
 		provisioning.EnsureBaremetalOperatorDeployment,
 		provisioning.EnsureMetal3StateService,
@@ -387,6 +389,22 @@ func (r *ProvisioningReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if bmoState == appsv1.DeploymentReplicaFailure {
 		err = r.updateCOStatus(ReasonDeployTimedOut, "baremetal-operator deployment rollout taking too long", "")
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("unable to put %q ClusterOperator in Degraded state: %w", clusterOperatorName, err)
+		}
+	}
+
+	// Determine the status of the ironic-networking deployment
+	networkingState, err := provisioning.GetIronicNetworkingDeploymentState(r.KubeClient.AppsV1(), ComponentNamespace, baremetalConfig)
+	if err != nil {
+		statusErr := r.updateCOStatus(ReasonResourceNotFound, "ironic-networking deployment inaccessible", "")
+		if statusErr != nil {
+			return ctrl.Result{}, fmt.Errorf("unable to put %q ClusterOperator in Degraded state: %w", clusterOperatorName, statusErr)
+		}
+		return ctrl.Result{}, errors.Wrap(err, "failed to determine state of ironic-networking deployment")
+	}
+	if networkingState == appsv1.DeploymentReplicaFailure {
+		err = r.updateCOStatus(ReasonDeployTimedOut, "ironic-networking deployment rollout taking too long", "")
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("unable to put %q ClusterOperator in Degraded state: %w", clusterOperatorName, err)
 		}
@@ -516,6 +534,12 @@ func (r *ProvisioningReconciler) deleteMetal3Resources(info *provisioning.Provis
 	}
 	if err := provisioning.DeleteMetal3Deployment(info); err != nil {
 		return errors.Wrap(err, "failed to delete metal3 deployment")
+	}
+	if err := provisioning.DeleteIronicNetworkingDeployment(info); err != nil {
+		return errors.Wrap(err, "failed to delete ironic-networking deployment")
+	}
+	if err := provisioning.DeleteIronicNetworkingService(info); err != nil {
+		return errors.Wrap(err, "failed to delete ironic-networking service")
 	}
 	if err := provisioning.DeleteMetal3StateService(info); err != nil {
 		return errors.Wrap(err, "failed to delete metal3 service")
